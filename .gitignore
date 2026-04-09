@@ -1,0 +1,8 @@
+dumps/
+memory/index/
+config/daemon.yaml
+
+# Output & temp
+.antigravity/
+.gradio/
+output.txt
