@@ -68,32 +68,34 @@ Ghost-Admin operates on a strict **7-stage MAPE-K closed-loop**:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Stage 1 — DETECT (Trend-Based Pre-Detection)
+### Stage 1 — DETECT (Trend-Based Pre-Detection & Cascade Correlation)
 
 Ghost-Admin does **not** wait for a crisis. It monitors a 60-second rolling RAM window and triggers at sustained growth rates before hard thresholds are breached.
 
 ```python
 # Trigger on growth trajectory, not just absolute value
-ram_history.append(psutil.virtual_memory().percent)
-if len(ram_history) >= 12:  # 60s at 5s polling
-    slope = (ram_history[-1] - ram_history[-12]) / 12
+ram_history.append(proc.memory_percent())
+if len(ram_history) >= WINDOW_TICKS:
+    slope = (ram_history[-1] - ram_history[0]) / WINDOW_TICKS
     if slope > 2.0 or ram_history[-1] > CRITICAL_THRESHOLD:
         trigger_pipeline(proc)
 ```
 
-This fires at **60% RAM climbing fast** — not 85% RAM already in crisis.
+**Cascade Correlation Engine (v1.1.0):** If 2+ distinct processes spike within a 60-second window, Ghost-Admin detects an OOM storm or coordinated attack. It suppresses automatic SIGKILLs and escalates the entire cluster to human review. 
 
 ---
 
 ### Stage 2 — ISOLATE (Whitelist Guardrail)
 
-Before any action, the PID is cross-referenced against a hardcoded system whitelist. `systemd`, `fish`, `Xorg`, `sshd`, and other critical processes are entirely immune. This prevents OS self-destruction.
+Before any action, the PID is cross-referenced against your operator whitelist (`config/whitelist.yaml`) and a hardcoded minimum floor (`systemd`, `sshd`, `init`, etc.). If a critical process is targeted, it is bypassed, preventing OS self-destruction.
+
+*The whitelist can be hot-reloaded without daemon restarts via `kill -HUP <pid>`.*
 
 ---
 
 ### Stage 3 — PROFILE (Behavioral Fingerprinting)
 
-Over 24 hours, Ghost-Admin builds a **per-process behavioral baseline** using rolling P95 RAM statistics. Thresholds become dynamic per process signature:
+Over 24 hours, background analysis builds a **per-process behavioral baseline** using rolling statistics. Thresholds become dynamic per process signature.
 
 ```python
 # A nightly ML training job hitting 78% RAM is normal.
@@ -102,7 +104,7 @@ if proc_ram > baselines[process_signature].p95 * 1.5:
     trigger_pipeline(proc)
 ```
 
-No two processes are treated the same. Ghost-Admin learns your environment's *normal*.
+Ghost-Admin hot-reloads these baselines every 30 seconds automatically. No two processes are treated the same. 
 
 ---
 
@@ -113,26 +115,26 @@ Before querying the AI, Ghost-Admin builds a rich `ProcessContext` object from m
 ```python
 context = {
     "ram_percent":        proc.memory_percent(),
-    "cpu_percent":        proc.cpu_percent(interval=1),
-    "open_file_handles":  len(proc.open_files()),
+    "rss_mb":             mem_info.rss / 1024 / 1024,
+    "cpu_percent":        proc.cpu_percent(interval=0.05),
+    "open_file_handles":  proc.num_fds(),
     "thread_count":       proc.num_threads(),
     "network_connections":len(proc.connections()),
     "runtime_seconds":    time.time() - proc.create_time(),
     "process_ancestry":   get_process_ancestry(proc.pid),
-    "journalctl_tail":    extract_logs(proc.pid),
+    "journalctl_tail":    extract_journalctl(proc.pid), # Extracted securely via subprocess
     "historical_context": rag_retrieve(proc.name, context)  # RAG layer
 }
 ```
 
-**Process Lineage Awareness:** Ghost-Admin walks the full process tree before any kill decision. If `python3` is the target but its parent is `gunicorn` → `systemd`, the AI is informed of the full ancestry — and can choose to terminate the orchestrator instead of triggering an infinite respawn loop.
-
-**RAG Memory Layer:** Every past incident post-mortem is embedded into a local FAISS vector index. Before querying the SLM, Ghost-Admin retrieves the 2 most semantically similar past incidents and injects them as context. The daemon gets smarter with every event it handles.
+**Process Lineage Awareness:** If `python3` is the target but its parent is `gunicorn` → `systemd`, the AI calculates intent over the full ancestry tree.
+**RAG Memory Layer:** Every past post-mortem is embedded into a FAISS vector index. The daemon retrieves strongly correlated past incidents before querying the SLM.
 
 ---
 
 ### Stage 5 — REASON (Intent Classification)
 
-Logs and context are piped into a local `llama3.2:3b` model running via Ollama (CUDA-accelerated). The AI classifies the situation across **5 intent categories**:
+Logs and context are piped into a local `llama3.2:3b` model via Ollama (CUDA-accelerated). The AI classifies the situation into 5 intents:
 
 ```
 WORKING_AS_INTENDED  — behavior consistent with process function
@@ -142,9 +144,7 @@ UNDER_ATTACK         — anomalous file/network activity (potential injection)
 UNKNOWN              — insufficient data for safe classification
 ```
 
-The `UNDER_ATTACK` classification makes Ghost-Admin the **first self-healing daemon with rudimentary intrusion detection built in** — because a process suddenly opening 200 file handles it has never accessed before is not a RAM problem, it's a security problem.
-
-The AI returns a strict JSON response:
+The `UNDER_ATTACK` classification makes Ghost-Admin the **first self-healing daemon with rudimentary intrusion detection built in**.
 
 ```json
 {
@@ -156,19 +156,17 @@ The AI returns a strict JSON response:
 }
 ```
 
-If `confidence < 0.70` or `intent == "UNKNOWN"`, the action is automatically escalated rather than executed.
-
 ---
 
 ### Stage 6 — EXECUTE (Graceful Degradation Ladder)
 
-Ghost-Admin does **not** shoot first. A 4-step escalation ladder with configurable wait windows ensures the minimum necessary force is used:
+Ghost-Admin does **not** shoot first. A 4-step escalation ladder executes sequentially inside a **non-blocking daemon thread**, ensuring the core detection loop continues scanning the rest of the OS uninterrupted.
 
 ```
 Step 1: SIGTERM  ──────── "Please close gracefully"          [wait 10s]
            │
            ▼ (if still running)
-Step 2: cgroup memory cap ─ Artificially ceiling the process  [wait 30s]
+Step 2: cgroup memory max ─ Artificial ceiling forces internal OOM
            │
            ▼ (if still running)
 Step 3: SIGSTOP  ──────── Freeze, buy time, alert humans     [wait 60s]
@@ -177,40 +175,29 @@ Step 3: SIGSTOP  ──────── Freeze, buy time, alert humans     [wa
 Step 4: SIGKILL  ──────── Nuclear option, full audit logged
 ```
 
-**Pre-Kill Forensic Checkpoint:** Before any SIGKILL, Ghost-Admin dumps the process memory map to disk via `gcore`. Engineers can perform post-mortem analysis on *why* the leak occurred — not just *that* it did.
-
-```bash
-gcore -o /var/ghost-admin/dumps/pre_kill_{pid}_{timestamp} {pid}
-```
-
-**Cascade Correlation:** If 2+ processes spike within a 60-second window, Ghost-Admin detects a potential cascade failure, halts individual kill decisions, and escalates the entire event cluster to human review. A cascade is handled as a single incident, not multiple unrelated ones.
+**Pre-Kill Forensic Checkpoint:** Before SIGKILL, Ghost-Admin dumps the process memory map to disk via `gcore`. Engineers can dissect the exact memory structure post-mortem.
 
 ---
 
-### Stage 7 — AUDIT (Compliance-Ready JSONL Log)
+### Stage 7 — AUDIT (SIEM-Ready Splunk/Elastic Logging)
 
-Every single daemon action — including non-events — is written to an append-only JSONL audit log:
+Every daemon action uses Python's `RotatingFileHandler` to push JSONL payloads to `/var/ghost-admin/logs/audit.jsonl` safely.
 
 ```json
 {
-  "timestamp": "2025-03-29T14:23:11Z",
-  "daemon_version": "1.0.0",
-  "event": "SIGKILL_EXECUTED",
+  "timestamp": "2026-04-12T14:23:11Z",
+  "daemon_version": "1.1.0",
+  "event": "CGROUP_CAP_SUCCESS",
   "pid": 4821,
   "process_name": "data_ingester",
   "process_ancestry": ["python3", "gunicorn", "systemd"],
-  "ram_at_trigger": 91.2,
-  "trigger_type": "THRESHOLD",
   "ai_intent": "LEAKING",
-  "ai_confidence": 0.91,
-  "escalation_steps_attempted": ["SIGTERM", "cgroup_cap", "SIGSTOP"],
-  "pre_kill_dump": "/var/ghost-admin/dumps/4821_1743259391.core",
-  "rag_incidents_referenced": ["incident_2025-03-12_nginx", "incident_2025-02-28_python3"],
-  "post_mortem": "/var/ghost-admin/reports/2025-03-29_4821.md"
+  "trigger_type": "SLOPE",
+  "escalation_steps_attempted": ["SIGTERM", "cgroup_cap"]
 }
 ```
 
-This output is directly ingestible by SIEM systems (Splunk, Elastic, Wazuh) and satisfies audit requirements in manufacturing, healthcare, and financial environments.
+Ingestible by Splunk, Datadog, Elastic, and satisfies high audit requirements out of the box.
 
 ---
 
@@ -218,14 +205,12 @@ This output is directly ingestible by SIEM systems (Splunk, Elastic, Wazuh) and 
 
 | Layer | Technology |
 |---|---|
-| **Inference** | Ollama · llama3.2:3b · CUDA (local GPU) |
+| **Inference/AI** | Ollama · llama3.2:3b · CUDA (local GPU) |
 | **RAG / Memory** | FAISS · sentence-transformers (local) |
-| **System Telemetry** | psutil · journalctl · /proc |
+| **System Telemetry** | psutil · journalctl |
 | **Process Control** | os.kill · subprocess · cgroups v2 |
-| **Forensics** | gcore (GNU Core Utilities) |
-| **Audit** | JSONL append-only log · Markdown post-mortems |
-| **Environment** | Garuda Linux (Arch-based) · Python 3.10+ |
-| **Hardware Target** | NVIDIA RTX 3050 Ti (4GB VRAM) · 16GB RAM |
+| **Forensics / SIEM** | gcore · `logging.handlers.RotatingFileHandler` |
+| **Environment** | Linux · Python 3.10+ |
 
 ---
 
@@ -235,30 +220,20 @@ This output is directly ingestible by SIEM systems (Splunk, Elastic, Wazuh) and 
 ghost-admin/
 ├── daemon/
 │   ├── main.py                  # Entry point & daemon loop
-│   ├── detect.py                # Trend-based pre-detection
-│   ├── profile.py               # Behavioral fingerprinting & baselines
-│   ├── extract.py               # Multi-signal context fusion & log extraction
-│   ├── reason.py                # Ollama AI interface & intent classification
-│   ├── execute.py               # Graceful degradation ladder & SIGKILL
-│   └── audit.py                 # JSONL logger & post-mortem writer
-├── memory/
-│   ├── rag.py                   # FAISS vector index & retrieval
-│   ├── embedder.py              # sentence-transformers local embeddings
-│   └── index/                   # Persisted FAISS index (gitignored)
+│   ├── detect.py                # Pre-detection & Cascade Correlation
+│   ├── profile.py               # Hot-reloaded behavioural baselines
+│   ├── extract.py               # Telemetry / journalctl fusion
+│   ├── reason.py                # Ollama SLM inference interface
+│   ├── execute.py               # Threaded graceful degradation ladder
+│   └── audit.py                 # SIEM JSONL rotating logger
+├── memory/                      # RAG FAISS index embeddings
 ├── config/
-│   ├── whitelist.yaml           # Critical process whitelist
-│   ├── thresholds.yaml          # Per-process baseline overrides
-│   └── daemon.yaml              # Global daemon configuration
-├── reports/                     # Markdown post-mortem output directory
-├── dumps/                       # Pre-kill gcore memory dumps (gitignored)
-├── logs/
-│   └── audit.jsonl              # Append-only SIEM-ready audit log
-├── tests/
-│   ├── test_detect.py
-│   ├── test_reason.py
-│   └── test_cascade.py
+│   ├── whitelist.yaml           # Operator process immune exceptions
+│   ├── thresholds.yaml          # Detection math parameters
+│   └── daemon.yaml.example      # General service configuration
 ├── systemd/
-│   └── ghost-admin.service      # systemd unit file for daemon install
+│   └── ghost-admin.service      # Hardened systemd unit file
+├── tests/                       # Unit tests (Mocked, no root required)
 └── README.md
 ```
 
@@ -274,76 +249,24 @@ cd ghost-admin
 # Create virtualenv
 python -m venv .venv && source .venv/bin/activate
 
-# Install dependencies
-pip install psutil requests faiss-cpu sentence-transformers pyyaml
+# Install dependencies (psutil, pyyaml, requests)
+pip install -r requirements.txt
 
-# Ensure Ollama is running with llama3.2:3b
-ollama pull llama3.2:3b
-
-# Configure
+# Configure settings
 cp config/daemon.yaml.example config/daemon.yaml
-# Edit whitelist.yaml with your critical process names
+nano config/whitelist.yaml
+nano config/thresholds.yaml
 
-# Run
+# Run tests
+pytest tests/
+
+# Start as standard user (test mode)
 python daemon/main.py
 
-# Or install as systemd service
+# Install to systemd for production (requires root/sudo)
 sudo cp systemd/ghost-admin.service /etc/systemd/system/
 sudo systemctl enable --now ghost-admin
 ```
-
----
-
-## Configuration
-
-```yaml
-# config/daemon.yaml
-inference:
-  endpoint: "http://localhost:11434/api/generate"
-  model: "llama3.2:3b"
-  confidence_threshold: 0.70     # Below this → escalate, never kill
-
-monitoring:
-  poll_interval_seconds: 5
-  ram_hard_threshold: 85.0        # Absolute ceiling fallback
-  trend_window_seconds: 60        # Rolling window for slope detection
-  trend_slope_threshold: 2.0      # % per poll = early trigger
-  cascade_window_seconds: 60      # Multi-process correlation window
-
-execution:
-  sigterm_wait_seconds: 10
-  cgroup_cap_wait_seconds: 30
-  sigstop_wait_seconds: 60
-  forensic_dump_enabled: true
-  dump_directory: "/var/ghost-admin/dumps"
-
-audit:
-  log_path: "/var/ghost-admin/logs/audit.jsonl"
-  report_directory: "/var/ghost-admin/reports"
-```
-
----
-
-## Results (Design Targets)
-
-| Metric | Baseline (Manual) | Ghost-Admin Target |
-|---|---|---|
-| Mean time to detection | ~15 minutes (on-call) | < 30 seconds |
-| False positive kill rate | N/A | < 5% (confidence gate) |
-| Cloud API calls per incident | 0 (air-gapped) | 0 |
-| Audit trail completeness | Manual notes | 100% automated JSONL |
-| Post-mortem forensic data | None | Full gcore dump + Markdown |
-
----
-
-## Roadmap
-
-- [ ] Web dashboard (FastAPI + HTMX) for audit log visualization
-- [ ] Telegram/Slack escalation webhook for human-in-the-loop alerts  
-- [ ] Prometheus metrics exporter (Grafana-compatible)
-- [ ] Multi-node support (SSH-based remote healing)
-- [ ] Model hot-swap (qwen2.5:3b as fallback when llama3.2 is busy)
-- [ ] Docker container process healing support
 
 ---
 
@@ -351,11 +274,10 @@ audit:
 
 In Industry 4.0 environments, factory telemetry, process names, and log contents are **proprietary operational data**. Sending them to cloud AI APIs (OpenAI, Gemini, Claude) is a non-starter for:
 - Zero-trust security architectures
-- GDPR / data residency compliance  
 - Air-gapped production networks with no internet access
 - Supply chain security requirements
 
-Ghost-Admin's entire inference stack runs on your hardware. **Zero bytes of operational data leave your machine.**
+Ghost-Admin runs 100% on bare metal hardware. **Zero bytes of operational data leave your machine.**
 
 ---
 
@@ -363,10 +285,6 @@ Ghost-Admin's entire inference stack runs on your hardware. **Zero bytes of oper
 
 **Aaryan Patwardhan** · [GitHub](https://github.com/Aaryan-Patwardhan) · [LinkedIn](https://linkedin.com/in/aaryan-patwardhan)
 
-B.E. Information Technology · Savitribai Phule Pune University · 2027
+Pursuing a B.E. in Information Technology · Savitribai Phule Pune University
 
 > *Ghost-Admin is an architecture-first research project demonstrating production-grade autonomous systems design.*
-
----
-
-*Built on Garuda Linux. Runs on bare metal. Costs $0 to operate.*
