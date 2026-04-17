@@ -1,0 +1,40 @@
+# Ghost-Admin — Daemon Configuration Example
+# Copy this file to daemon.yaml and adjust for your environment.
+# cp config/daemon.yaml.example config/daemon.yaml
+
+# --- Ollama / LLM Settings ---
+ollama:
+  url: "http://localhost:11434/api/generate"
+  model: "llama3.2:3b"
+  timeout_secs: 15
+  # Confidence below this threshold triggers human escalation instead of auto-action
+  min_confidence: 0.70
+
+# --- Runtime ---
+daemon:
+  tick_interval_secs: 5
+  pid_file: "/var/ghost-admin/ghost_admin.pid"
+  log_level: "INFO"    # DEBUG | INFO | WARNING | ERROR
+
+# --- Audit Log ---
+audit:
+  log_dir: "/var/ghost-admin/logs"
+  max_bytes: 10485760    # 10 MB per file
+  backup_count: 5
+
+# --- Forensics ---
+forensics:
+  dumps_dir: "/var/ghost-admin/dumps"
+  # Set to false if gcore is not installed or not running as root
+  pre_kill_dump_enabled: true
+
+# --- Profiling ---
+profiling:
+  baselines_path: "memory/baselines.json"
+  reload_interval_secs: 30
+  violation_multiplier: 1.5
+
+# --- Cascade Correlation ---
+cascade:
+  window_secs: 60
+  trigger_count: 2

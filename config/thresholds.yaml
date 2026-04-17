@@ -1,0 +1,26 @@
+# Ghost-Admin — Detection Thresholds
+# All values are loaded at daemon startup and used by detect.py.
+# Edit this file and send SIGHUP to reload:  kill -HUP $(cat /var/ghost-admin/ghost_admin.pid)
+
+# --- RAM Detection ---
+# Absolute critical threshold: flag a process once its RAM share crosses this
+ram_critical_pct: 85.0
+
+# Slope trigger: flag if RAM grows by more than this percentage PER TICK within the window
+# (at 5s tick interval, 2.0 means +2% per 5 seconds = ~24% growth per minute)
+ram_slope_pct_per_tick: 2.0
+
+# Rolling window: how many ticks of history to maintain per PID
+# Default 12 ticks × 5s tick = 60-second window
+rolling_window_ticks: 12
+
+# --- Cascade Correlation ---
+# If this many DISTINCT processes trigger within cascade_window_secs, suppress auto-kill
+# and escalate the entire group to human review (OOM storm / coordinated attack signal)
+cascade_window_secs: 60
+cascade_trigger_count: 2
+
+# --- Profile Comparison ---
+# A process must exceed (p95_baseline × this multiplier) to be flagged in the profile stage
+# 1.5 = 50% above its normal P95 behaviour
+profile_violation_multiplier: 1.5

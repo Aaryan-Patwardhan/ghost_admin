@@ -1,0 +1,46 @@
+[Unit]
+Description=Ghost-Admin — Autonomous Server Healing Daemon
+Documentation=https://github.com/Aaryan-Patwardhan/ghost_admin
+After=network.target ollama.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/ghost_admin/daemon
+
+ExecStart=/usr/bin/python3 /opt/ghost_admin/daemon/main.py
+ExecReload=/bin/kill -HUP $MAINPID
+
+# PID file for kill -HUP
+PIDFile=/var/ghost-admin/ghost_admin.pid
+
+# Give the daemon 30 seconds to flush logs and audit entries cleanly on stop
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=5s
+
+# Logging: pipe stdout/stderr to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ghost_admin
+
+# Runtime state directory — systemd creates /var/ghost-admin/ automatically
+RuntimeDirectory=ghost-admin
+RuntimeDirectoryMode=0750
+
+# Security hardening
+NoNewPrivileges=false        # Must be false — daemon needs ptrace + cgroup writes
+ProtectSystem=strict
+ReadWritePaths=/var/ghost-admin /sys/fs/cgroup
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=false   # Must be false — daemon writes to cgroup memory.max
+
+[Install]
+WantedBy=multi-user.target

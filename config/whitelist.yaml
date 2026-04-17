@@ -1,0 +1,19 @@
+# Ghost-Admin — Operator Whitelist
+# Processes listed here will NEVER be touched by the daemon.
+# The hardcoded immune list (systemd, sshd, init, etc.) is always applied
+# in addition to this file — you cannot override the hardcoded floor.
+#
+# Add any site-specific processes that should be excluded from healing:
+#   e.g. your database, a critical background worker, a monitoring agent.
+#
+# Changes take effect on SIGHUP (no restart required):
+#   kill -HUP $(cat /var/ghost-admin/ghost_admin.pid)
+
+immune_processes:
+  # Examples — uncomment and extend as needed:
+  # - postgres
+  # - mysqld
+  # - nginx
+  # - redis-server
+  # - prometheus
+  # - node_exporter
